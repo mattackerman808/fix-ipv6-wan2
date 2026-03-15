@@ -42,10 +42,11 @@ if [ -z "$WAN2_MARK" ]; then
 fi
 
 # --- Discover WAN2 global IPv6 address ---
-WAN2_ADDR=$(ip -6 addr show dev "$WAN2_IFACE" scope global -dynamic | grep -oP '(?<=inet6 )\S+(?=/128)' | head -1)
+WAN2_ADDR=$(ip -6 addr show dev "$WAN2_IFACE" scope global dynamic | grep -oP '(?<=inet6 )\S+(?=/128)' | head -1)
 
 # --- Discover PD prefix on guest bridge ---
-PD_CIDR=$(ip -6 addr show dev "$GUEST_BRIDGE" scope global -dynamic | grep -oP '\S+::/\d+' | head -1)
+# Use the kernel route for the connected network, which gives the exact prefix
+PD_CIDR=$(ip -6 route show dev "$GUEST_BRIDGE" proto kernel | grep -oP '\S+::/\d+' | head -1)
 
 if [ -z "$WAN2_ADDR" ] && [ -z "$PD_CIDR" ]; then
     log "WARN: No IPv6 addresses found on ${WAN2_IFACE} or ${GUEST_BRIDGE}, nothing to do"
@@ -56,7 +57,9 @@ log "WAN2=${WAN2_IFACE} mark=${WAN2_MARK} addr=${WAN2_ADDR:-none} pd=${PD_CIDR:-
 
 # --- Mangle rules ---
 # Find the catch-all mark rule that assigns traffic to primary WAN
-CATCHALL_LINE=$(ip6tables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers 2>/dev/null | grep "prob-name.*wf-group.*single" | awk '{print $1}')
+# Match the catch-all: a MARK rule with source ::/0 that sets a mark in the WAN mask range
+# This covers both the original prob-name rule and manually restored versions
+CATCHALL_LINE=$(ip6tables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers 2>/dev/null | grep "^[0-9].*MARK.*::/0.*::/0.*MARK xset" | tail -1 | awk '{print $1}')
 if [ -z "$CATCHALL_LINE" ]; then
     log "ERROR: Could not find catch-all mark rule in ${MANGLE_CHAIN}"
     exit 1
@@ -71,29 +74,40 @@ add_mangle_rule() {
     # Remove stale rules for this source (address may have changed)
     while ip6tables -t mangle -D "$MANGLE_CHAIN" -s "$src" -m mark --mark "0x0/${MARK_MASK}" -j MARK --set-xmark "${WAN2_MARK}/${MARK_MASK}" 2>/dev/null; do :; done
     # Recalculate catchall line in case removals shifted it
-    CATCHALL_LINE=$(ip6tables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers | grep "prob-name.*wf-group.*single" | awk '{print $1}')
+    CATCHALL_LINE=$(ip6tables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers | grep "^[0-9].*MARK.*::/0.*::/0.*MARK xset" | tail -1 | awk '{print $1}')
     ip6tables -t mangle -I "$MANGLE_CHAIN" "$CATCHALL_LINE" -s "$src" -m mark --mark "0x0/${MARK_MASK}" -j MARK --set-xmark "${WAN2_MARK}/${MARK_MASK}"
     log "  mangle ${desc}: added"
 }
 
 # Clean up stale mangle rules (old WAN2 addresses no longer on the interface)
+# Uses match-based deletion (-D with criteria) instead of line numbers to avoid
+# accidentally deleting the wrong rule when line numbers shift.
 cleanup_stale_mangle() {
+    # Store both with and without CIDR suffix for matching against ip6tables output
     local current_sources=()
-    [ -n "$WAN2_ADDR" ] && current_sources+=("${WAN2_ADDR}/128")
-    [ -n "$PD_CIDR" ] && current_sources+=("$PD_CIDR")
+    if [ -n "${WAN2_ADDR:-}" ]; then
+        current_sources+=("${WAN2_ADDR}/128")
+        current_sources+=("${WAN2_ADDR}")
+    fi
+    [ -n "${PD_CIDR:-}" ] && current_sources+=("$PD_CIDR")
 
-    ip6tables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers | grep "MARK.*${WAN2_MARK}" | grep -v "prob-name" | while read -r line; do
-        local src=$(echo "$line" | awk '{print $4}')
+    # Collect stale sources first, then delete
+    local stale_sources=()
+    while read -r src; do
+        [ -z "$src" ] && continue
         [ "$src" = "::/0" ] && continue
         local found=false
         for cs in "${current_sources[@]}"; do
             [ "$src" = "$cs" ] && found=true
         done
         if [ "$found" = false ]; then
-            local linenum=$(echo "$line" | awk '{print $1}')
-            log "  mangle cleanup: removing stale rule for ${src}"
-            ip6tables -t mangle -D "$MANGLE_CHAIN" "$linenum" 2>/dev/null || true
+            stale_sources+=("$src")
         fi
+    done < <(ip6tables -t mangle -L "$MANGLE_CHAIN" -n | grep "MARK.*${WAN2_MARK}" | grep -v " ::/0 .* ::/0 " | awk '{print $3}')
+
+    for src in "${stale_sources[@]}"; do
+        log "  mangle cleanup: removing stale rule for ${src}"
+        ip6tables -t mangle -D "$MANGLE_CHAIN" -s "$src" -m mark --mark "0x0/${MARK_MASK}" -j MARK --set-xmark "${WAN2_MARK}/${MARK_MASK}" 2>/dev/null || true
     done
 }
 
