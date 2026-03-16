@@ -1,15 +1,18 @@
 #!/bin/bash
 # fix-ipv6-wan2.sh
 #
-# Ensures IPv6 traffic sourced from WAN2 (Xfinity) addresses routes out
+# Ensures IPv6 traffic that should use WAN2 (Xfinity) actually routes out
 # the correct interface instead of being hijacked by UDM WAN failover.
 #
 # Problem: The UBIOS_WF_GROUP_1_SINGLE mangle chain marks all new IPv6
 # connections for the primary WAN (ATT/eth9). This overrides source-based
-# routing, causing Xfinity-sourced IPv6 to go out ATT where it's dropped.
+# routing AND static routes, causing WAN2 IPv6 traffic to go out ATT
+# where it's dropped.
 #
-# Solution: Insert mangle rules to mark Xfinity-sourced traffic with the
-# WAN2 fwmark, and add ip6 routing rules for delegated prefixes.
+# Solution: Insert mangle rules to mark WAN2 traffic with the WAN2 fwmark:
+#   - Source-based: WAN2 address and prefix-delegated subnets (-s rules)
+#   - Destination-based: IPv6 static routes via WAN2 (-d rules)
+# Also adds ip6 routing rules for delegated prefixes.
 #
 # Install:
 #   cp fix-ipv6-wan2.sh /etc/networkd-dispatcher/routable.d/50-fix-ipv6-wan2
@@ -48,12 +51,22 @@ WAN2_ADDR=$(ip -6 addr show dev "$WAN2_IFACE" scope global dynamic | grep -oP '(
 # Use the kernel route for the connected network, which gives the exact prefix
 PD_CIDR=$(ip -6 route show dev "$GUEST_BRIDGE" proto kernel | grep -oP '\S+::/\d+' | head -1)
 
-if [ -z "$WAN2_ADDR" ] && [ -z "$PD_CIDR" ]; then
-    log "WARN: No IPv6 addresses found on ${WAN2_IFACE} or ${GUEST_BRIDGE}, nothing to do"
+# --- Discover static routes via WAN2 ---
+# Find destination prefixes of non-default, non-connected routes using WAN2.
+# These are typically added via the UniFi API or manually.
+STATIC_DSTS=()
+while IFS= read -r prefix; do
+    [ -n "$prefix" ] && STATIC_DSTS+=("$prefix")
+done < <(ip -6 route show dev "$WAN2_IFACE" | \
+    grep -v -E "^default|^::/0|^fe80|^ff0|proto kernel|proto ra|proto dhcp|^unreachable" | \
+    awk '{print $1}')
+
+if [ -z "$WAN2_ADDR" ] && [ -z "$PD_CIDR" ] && [ ${#STATIC_DSTS[@]} -eq 0 ]; then
+    log "WARN: No IPv6 addresses on ${WAN2_IFACE}/${GUEST_BRIDGE} and no static routes, nothing to do"
     exit 0
 fi
 
-log "WAN2=${WAN2_IFACE} mark=${WAN2_MARK} addr=${WAN2_ADDR:-none} pd=${PD_CIDR:-none}"
+log "WAN2=${WAN2_IFACE} mark=${WAN2_MARK} addr=${WAN2_ADDR:-none} pd=${PD_CIDR:-none} static_routes=${#STATIC_DSTS[@]}"
 
 # --- Mangle rules ---
 # Find the catch-all mark rule that assigns traffic to primary WAN
@@ -76,6 +89,18 @@ add_mangle_rule() {
     # Recalculate catchall line in case removals shifted it
     CATCHALL_LINE=$(ip6tables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers | grep "^[0-9].*MARK.*::/0.*::/0.*MARK xset" | tail -1 | awk '{print $1}')
     ip6tables -t mangle -I "$MANGLE_CHAIN" "$CATCHALL_LINE" -s "$src" -m mark --mark "0x0/${MARK_MASK}" -j MARK --set-xmark "${WAN2_MARK}/${MARK_MASK}"
+    log "  mangle ${desc}: added"
+}
+
+add_dst_mangle_rule() {
+    local dst="$1" desc="$2"
+    if ip6tables -t mangle -C "$MANGLE_CHAIN" -d "$dst" -m mark --mark "0x0/${MARK_MASK}" -j MARK --set-xmark "${WAN2_MARK}/${MARK_MASK}" 2>/dev/null; then
+        log "  mangle ${desc}: ok (exists)"
+        return 0
+    fi
+    # Recalculate catchall line in case prior insertions shifted it
+    CATCHALL_LINE=$(ip6tables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers | grep "^[0-9].*MARK.*::/0.*::/0.*MARK xset" | tail -1 | awk '{print $1}')
+    ip6tables -t mangle -I "$MANGLE_CHAIN" "$CATCHALL_LINE" -d "$dst" -m mark --mark "0x0/${MARK_MASK}" -j MARK --set-xmark "${WAN2_MARK}/${MARK_MASK}"
     log "  mangle ${desc}: added"
 }
 
@@ -113,12 +138,42 @@ cleanup_stale_mangle() {
 
 cleanup_stale_mangle
 
+# Clean up stale destination-based mangle rules (static routes that were removed)
+# Uses ip6tables -S for reliable parsing of -d flags
+cleanup_stale_dst_mangle() {
+    local stale_dsts=()
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local dst
+        dst=$(echo "$line" | grep -oP '(?<=-d )\S+')
+        [ -z "$dst" ] && continue
+        local found=false
+        for cd in "${STATIC_DSTS[@]+"${STATIC_DSTS[@]}"}"; do
+            [ "$dst" = "$cd" ] && found=true
+        done
+        if [ "$found" = false ]; then
+            stale_dsts+=("$dst")
+        fi
+    done < <(ip6tables -t mangle -S "$MANGLE_CHAIN" 2>/dev/null | grep -- "-d " | grep -v -- "-s " | grep "${WAN2_MARK}")
+
+    for dst in "${stale_dsts[@]+"${stale_dsts[@]}"}"; do
+        log "  mangle dst cleanup: removing stale rule for ${dst}"
+        ip6tables -t mangle -D "$MANGLE_CHAIN" -d "$dst" -m mark --mark "0x0/${MARK_MASK}" -j MARK --set-xmark "${WAN2_MARK}/${MARK_MASK}" 2>/dev/null || true
+    done
+}
+
+cleanup_stale_dst_mangle
+
 if [ -n "$PD_CIDR" ]; then
     add_mangle_rule "$PD_CIDR" "pd-prefix"
 fi
 if [ -n "$WAN2_ADDR" ]; then
     add_mangle_rule "${WAN2_ADDR}/128" "wan2-addr"
 fi
+
+for dst in "${STATIC_DSTS[@]+"${STATIC_DSTS[@]}"}"; do
+    add_dst_mangle_rule "$dst" "static-${dst}"
+done
 
 # --- Routing rules ---
 add_route_rule() {
