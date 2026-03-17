@@ -1,6 +1,9 @@
 #!/bin/bash
 # fix-ipv6-wan2.sh
 #
+# Copyright (c) 2026 Matthew Ackerman <matt@808.org>
+# Licensed under the MIT License. See LICENSE file for details.
+#
 # Ensures IPv6 traffic that should use WAN2 (Xfinity) actually routes out
 # the correct interface instead of being hijacked by UDM WAN failover.
 #
