@@ -35,11 +35,16 @@ WAN2_MACS="${WAN2_MACS:-}"  # Extra MACs to force through WAN2 (in addition to a
 MANGLE_CHAIN="UBIOS_WF_GROUP_1_SINGLE"
 ROUTE_TABLE="202.${WAN2_IFACE}"
 RULE_PRIORITY="32504"
-# Priority for the fwmark→WAN2 routing rule. Must be lower than UBIOS's
-# auto-created "iif br<X> lookup 201.<wan1>" rules (typically at 32500)
-# or marked packets get routed via WAN1 before the existing fwmark rule
-# at priority ~32503 is ever consulted.
-FWMARK_RULE_PRIORITY="32400"
+# Priority for the fwmark→WAN2 routing rule. Must be lower than:
+#   - UBIOS's "from all lookup main" at 32000 (RA can install a v6 default
+#     into main via WAN1, which would otherwise win for marked packets)
+#   - UBIOS's "iif br<X> lookup 201.<wan1>" at 32500
+# A low priority (100) makes the rule the first thing the kernel checks
+# for marked packets, ahead of anything UBIOS or the kernel adds.
+FWMARK_RULE_PRIORITY="100"
+# Old priorities that previous versions of this script used; the script
+# cleans them up so upgrades leave a single rule.
+FWMARK_RULE_OLD_PRIORITIES="32400"
 MARK_MASK="0x7e0000"
 NAT6_FLAG="0x1"  # Bit flag to identify IPv6 NAT traffic in POSTROUTING
 LOG_TAG="fix-ipv6-wan2"
@@ -314,14 +319,22 @@ if [ -n "$PD_CIDR" ]; then
     add_route_rule "$PD_CIDR" "pd-prefix"
 fi
 
-# Ensure WAN2-marked packets reach the WAN2 routing table BEFORE UBIOS's
-# "iif br<X> lookup 201.<wan1>" rule hijacks them via the source bridge.
+# Ensure WAN2-marked packets reach the WAN2 routing table before anything
+# in main (including a WAN1 v6 default from RA) or the bridge iif rules.
 if ip -6 rule show | grep -q "^${FWMARK_RULE_PRIORITY}:.*fwmark ${WAN2_MARK}.*lookup ${ROUTE_TABLE}"; then
     log "  fwmark rule: ok (exists)"
 else
     ip -6 rule add fwmark "${WAN2_MARK}/${MARK_MASK}" lookup "$ROUTE_TABLE" priority "$FWMARK_RULE_PRIORITY"
     log "  fwmark rule: added (priority ${FWMARK_RULE_PRIORITY})"
 fi
+
+# Clean up stale fwmark rules left behind by earlier versions of this script.
+for old_prio in $FWMARK_RULE_OLD_PRIORITIES; do
+    if ip -6 rule show | grep -q "^${old_prio}:.*fwmark ${WAN2_MARK}.*lookup ${ROUTE_TABLE}"; then
+        ip -6 rule del fwmark "${WAN2_MARK}/${MARK_MASK}" lookup "$ROUTE_TABLE" priority "$old_prio" 2>/dev/null
+        log "  fwmark rule cleanup: removed stale rule at priority ${old_prio}"
+    fi
+done
 
 # Clean up stale route rules (old PD prefixes)
 ip -6 rule show | grep "priority ${RULE_PRIORITY}" | grep "lookup ${ROUTE_TABLE}" | while read -r line; do
